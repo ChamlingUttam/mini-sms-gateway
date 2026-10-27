@@ -6,3 +6,96 @@ generator client {
 datasource db {
   provider = "postgresql"
 }
+
+enum MessageStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
+enum CreditTransactionType {
+  CREDIT
+  DEDUCTION
+  REFUND
+}
+
+model User {
+  id        String    @id @default(cuid())
+  email     String    @unique
+  password  String
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  wallet    Wallet?
+  messages  Message[]
+}
+
+model Wallet {
+  id           String              @id @default(cuid())
+  userId       String              @unique
+  balance      Int                 @default(0)
+  createdAt    DateTime            @default(now())
+  updatedAt    DateTime            @updatedAt
+  user         User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transactions CreditTransaction[]
+}
+
+model SmsProvider {
+  id          String           @id @default(cuid())
+  name        String           @unique
+  priority    Int
+  balance     Int              @default(0)
+  failureRate Float            @default(0)
+  isActive    Boolean          @default(true)
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+  attempts    MessageAttempt[]
+
+  @@index([isActive, priority])
+}
+
+model Message {
+  id           String              @id @default(cuid())
+  userId       String
+  to           String
+  content      String
+  parts        Int
+  cost         Int
+  status       MessageStatus       @default(PENDING)
+  createdAt    DateTime            @default(now())
+  updatedAt    DateTime            @updatedAt
+  user         User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  attempts     MessageAttempt[]
+  transactions CreditTransaction[]
+
+  @@index([userId, createdAt])
+  @@index([status, createdAt])
+  @@index([to])
+}
+
+model MessageAttempt {
+  id           String        @id @default(cuid())
+  messageId    String
+  providerId   String
+  status       MessageStatus @default(PENDING)
+  errorMessage String?
+  createdAt    DateTime      @default(now())
+  message      Message       @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  provider     SmsProvider   @relation(fields: [providerId], references: [id], onDelete: Restrict)
+
+  @@index([messageId, createdAt])
+  @@index([providerId])
+}
+
+model CreditTransaction {
+  id        String                @id @default(cuid())
+  walletId  String
+  messageId String?
+  amount    Int
+  type      CreditTransactionType
+  createdAt DateTime              @default(now())
+  wallet    Wallet                @relation(fields: [walletId], references: [id], onDelete: Restrict)
+  message   Message?              @relation(fields: [messageId], references: [id], onDelete: SetNull)
+
+  @@index([walletId, createdAt])
+  @@index([messageId])
+}
