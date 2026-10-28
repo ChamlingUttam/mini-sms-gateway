@@ -9,19 +9,27 @@
   "scripts": {
     "dev": "prisma generate && tsx watch src/server.ts",
     "build": "prisma generate && tsc -p tsconfig.json",
+    "typecheck": "prisma generate && tsc --noEmit -p tsconfig.json",
     "start": "node dist/server.js",
-    "db:check": "prisma generate && tsx src/scripts/check-database.ts"
+    "db:check": "prisma generate && tsx src/scripts/check-database.ts",
+    "test": "tsx --test tests/auth.test.ts"
   },
   "dependencies": {
     "@prisma/adapter-neon": "7.10.1",
     "@prisma/client": "7.10.1",
+    "bcrypt": "^6.0.0",
+    "bcryptjs": "^3.0.3",
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
-    "express": "^5.1.0"
+    "express": "^5.1.0",
+    "jose": "^6.2.13",
+    "jsonwebtoken": "^9.0.3"
   },
   "devDependencies": {
+    "@types/bcrypt": "^6.0.0",
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.3",
+    "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^22.19.0",
     "prisma": "7.10.1",
     "tsx": "^4.20.6",
