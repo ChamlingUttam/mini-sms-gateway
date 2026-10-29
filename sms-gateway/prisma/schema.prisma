@@ -10,6 +10,7 @@ datasource db {
 enum MessageStatus {
   PENDING
   SENT
+  PROCESSING
   FAILED
 }
 
