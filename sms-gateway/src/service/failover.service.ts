@@ -2,268 +2,203 @@
 import { prisma } from "../lib/prisma.js";
 import { sendSms } from "./mock-provider.service.js";
 
-class InsufficientCreditsError extends Error {}
+export class InsufficientCreditsError extends Error {}
 
-type FailoverResult =
-  | {
-      status: "SENT";
-      messageId: string;
-      providerId: string;
-      providerName: string;
+type PreparedMessage = {
+  to: string;
+  content: string;
+  parts: number;
+  cost: number;
+};
+
+type DeliveryResult = {
+  messageId: string;
+  to: string;
+  cost: number;
+  status: "SENT" | "FAILED" | "SKIPPED";
+  provider?: string;
+  reason?: string;
+};
+
+export const sendBatchWithFailover = async (
+  userId: string,
+  messages: PreparedMessage[],
+): Promise<DeliveryResult[]> => {
+  const totalCost = messages.reduce((sum, message) => sum + message.cost, 0);
+
+  // Reserve the full batch cost and create its records atomically.
+  const reservedMessages = await prisma.$transaction(async (tx) => {
+    const debit = await tx.wallet.updateMany({
+      where: {
+        userId,
+        balance: { gte: totalCost },
+      },
+      data: {
+        balance: { decrement: totalCost },
+      },
+    });
+
+    if (debit.count !== 1) {
+      throw new InsufficientCreditsError("Insufficient wallet credits");
     }
-  | {
-      status: "FAILED";
-      messageId: string;
-      reason: string;
-    }
-  | {
-      status: "REJECTED";
-      messageId: string;
-      reason: string;
-    }
-  | {
-      status: "SKIPPED";
-      messageId: string;
-      currentStatus: string;
-    };
 
-export const sendWithFailover = async (
-  messageId: string,
-): Promise<FailoverResult> => {
-  // 1. Atomically claim the message and charge the wallet.
-  let reservation;
+    const created = [];
 
-  try {
-    reservation = await prisma.$transaction(async (tx) => {
-      const message = await tx.message.findUnique({
-        where: { id: messageId },
-      });
-
-      if (!message) {
-        throw new Error("Message not found");
-      }
-
-      if (!Number.isInteger(message.cost) || message.cost <= 0) {
-        throw new Error("Message cost must be a positive integer");
-      }
-
-      // Only one request can change PENDING to PROCESSING.
-      const claim = await tx.message.updateMany({
-        where: {
-          id: messageId,
+    for (const item of messages) {
+      const message = await tx.message.create({
+        data: {
+          userId,
+          to: item.to,
+          content: item.content,
+          parts: item.parts,
+          cost: item.cost,
           status: "PENDING",
         },
+      });
+
+      await tx.creditTransaction.create({
         data: {
-          status: "PROCESSING",
+          walletId: (
+            await tx.wallet.findUniqueOrThrow({
+              where: { userId },
+              select: { id: true },
+            })
+          ).id,
+          messageId: message.id,
+          amount: item.cost,
+          type: "DEDUCTION",
         },
       });
 
-      if (claim.count === 0) {
-        const current = await tx.message.findUnique({
-          where: { id: messageId },
-          select: { status: true },
+      created.push(message);
+    }
+
+    return created;
+  });
+
+  // Deliver each already-paid message. Do not debit the wallet again.
+  const results: DeliveryResult[] = [];
+
+  for (const message of reservedMessages) {
+    const claim = await prisma.message.updateMany({
+      where: { id: message.id, status: "PENDING" },
+      data: { status: "PROCESSING" },
+    });
+
+    if (claim.count !== 1) {
+      results.push({
+        messageId: message.id,
+        to: message.to,
+        cost: message.cost,
+        status: "SKIPPED",
+        reason: "Message was already claimed",
+      });
+      continue;
+    }
+
+    const providers = await prisma.smsProvider.findMany({
+      where: { isActive: true },
+      orderBy: [{ priority: "asc" }, { id: "asc" }],
+    });
+
+    let deliveredBy: string | undefined;
+
+    for (const provider of providers) {
+      const attempt = await prisma.messageAttempt.create({
+        data: {
+          messageId: message.id,
+          providerId: provider.id,
+          status: "PENDING",
+        },
+      });
+
+      const delivery = await sendSms(
+        provider.id,
+        message.to,
+        message.content,
+        message.cost,
+      );
+
+      if (!delivery.success) {
+        await prisma.messageAttempt.update({
+          where: { id: attempt.id },
+          data: {
+            status: "FAILED",
+            errorMessage: delivery.reason,
+          },
+        });
+        continue;
+      }
+
+      await prisma.$transaction(async (tx) => {
+        const finalized = await tx.message.updateMany({
+          where: { id: message.id, status: "PROCESSING" },
+          data: { status: "SENT" },
         });
 
-        if (!current) {
-          throw new Error("Message not found");
+        if (finalized.count !== 1) {
+          throw new Error("Could not finalize message");
         }
 
-        return {
-          claimed: false as const,
-          status: current.status,
-        };
-      }
-
-      const wallet = await tx.wallet.findUnique({
-        where: { userId: message.userId },
+        await tx.messageAttempt.update({
+          where: { id: attempt.id },
+          data: { status: "SENT", errorMessage: null },
+        });
       });
 
-      if (!wallet || wallet.balance < message.cost) {
-        throw new InsufficientCreditsError(
-          "Insufficient wallet credits",
-        );
-      }
+      deliveredBy = provider.name;
+      break;
+    }
 
-      // Conditional update prevents concurrent overspending.
-      const debit = await tx.wallet.updateMany({
-        where: {
-          id: wallet.id,
-          balance: { gte: message.cost },
-        },
-        data: {
-          balance: { decrement: message.cost },
-        },
+    if (deliveredBy) {
+      results.push({
+        messageId: message.id,
+        to: message.to,
+        cost: message.cost,
+        status: "SENT",
+        provider: deliveredBy,
+      });
+      continue;
+    }
+
+    // Every provider failed. Refund this message exactly once.
+    await prisma.$transaction(async (tx) => {
+      const finalized = await tx.message.updateMany({
+        where: { id: message.id, status: "PROCESSING" },
+        data: { status: "FAILED" },
       });
 
-      if (debit.count !== 1) {
-        throw new InsufficientCreditsError(
-          "Insufficient wallet credits",
-        );
+      if (finalized.count !== 1) {
+        throw new Error("Could not finalize failed message for refund");
       }
+
+      const wallet = await tx.wallet.findUniqueOrThrow({
+        where: { userId },
+      });
+
+      await tx.wallet.update({
+        where: { id: wallet.id },
+        data: { balance: { increment: message.cost } },
+      });
 
       await tx.creditTransaction.create({
         data: {
           walletId: wallet.id,
           messageId: message.id,
           amount: message.cost,
-          type: "DEDUCTION",
-        },
-      });
-
-      return {
-        claimed: true as const,
-        message,
-      };
-    });
-  } catch (error) {
-    if (error instanceof InsufficientCreditsError) {
-      return {
-        status: "REJECTED",
-        messageId,
-        reason: error.message,
-      };
-    }
-
-    throw error;
-  }
-
-  // A different request already claimed or completed this message.
-  if (!reservation.claimed) {
-    return {
-      status: "SKIPPED",
-      messageId,
-      currentStatus: reservation.status,
-    };
-  }
-
-  const message = reservation.message;
-
-  // 2. Load active providers in priority order.
-  const providers = await prisma.smsProvider.findMany({
-    where: { isActive: true },
-    orderBy: [{ priority: "asc" }, { id: "asc" }],
-  });
-
-  // 3. Attempt delivery through each provider.
-  for (const provider of providers) {
-    const attempt = await prisma.messageAttempt.create({
-      data: {
-        messageId,
-        providerId: provider.id,
-        status: "PENDING",
-      },
-    });
-
-    // Let unexpected database errors propagate instead of
-    // incorrectly treating them as ordinary provider failures.
-    const result = await sendSms(
-      provider.id,
-      message.to,
-      message.content,
-      message.cost,
-    );
-
-    if (!result.success) {
-      await prisma.messageAttempt.update({
-        where: { id: attempt.id },
-        data: {
-          status: "FAILED",
-          errorMessage: result.reason,
-        },
-      });
-
-      continue;
-    }
-
-    // Finalize the attempt and message together.
-    await prisma.$transaction(async (tx) => {
-      const finalized = await tx.message.updateMany({
-        where: {
-          id: messageId,
-          status: "PROCESSING",
-        },
-        data: { status: "SENT" },
-      });
-
-      if (finalized.count !== 1) {
-        throw new Error(
-          "Could not finalize message; manual reconciliation required",
-        );
-      }
-
-      await tx.messageAttempt.update({
-        where: { id: attempt.id },
-        data: {
-          status: "SENT",
-          errorMessage: null,
+          type: "REFUND",
         },
       });
     });
 
-    return {
-      status: "SENT",
-      messageId,
-      providerId: provider.id,
-      providerName: provider.name,
-    };
+    results.push({
+      messageId: message.id,
+      to: message.to,
+      cost: message.cost,
+      status: "FAILED",
+      reason: "All providers failed; credits refunded",
+    });
   }
 
-  // 4. All providers failed. Refund exactly once.
-  const refunded = await prisma.$transaction(async (tx) => {
-    // This conditional transition is the refund's idempotency guard.
-    const finalized = await tx.message.updateMany({
-      where: {
-        id: messageId,
-        status: "PROCESSING",
-      },
-      data: { status: "FAILED" },
-    });
-
-    if (finalized.count !== 1) {
-      return false;
-    }
-
-    const wallet = await tx.wallet.findUnique({
-      where: { userId: message.userId },
-    });
-
-    if (!wallet) {
-      throw new Error("Wallet not found during refund");
-    }
-
-    await tx.wallet.update({
-      where: { id: wallet.id },
-      data: {
-        balance: { increment: message.cost },
-      },
-    });
-
-    await tx.creditTransaction.create({
-      data: {
-        walletId: wallet.id,
-        messageId,
-        amount: message.cost,
-        type: "REFUND",
-      },
-    });
-
-    return true;
-  });
-
-  if (!refunded) {
-    return {
-      status: "SKIPPED",
-      messageId,
-      currentStatus: "No refund performed; message state changed",
-    };
-  }
-
-  return {
-    status: "FAILED",
-    messageId,
-    reason:
-      providers.length === 0
-        ? "No active providers available; credits refunded"
-        : "All providers failed; credits refunded",
-  };
+  return results;
 };

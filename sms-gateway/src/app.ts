@@ -3,11 +3,14 @@ import express from "express";
 import authRouter from "./modules/auth/auth.routes.js";
 import { errorHandler } from "./middlewares/error-handler.js";
 import smsRoutes from "./modules/sms/sms.routes.js";
+import { startMessageRecoveryWorker } from "./service/message-recovery.service.js";
 
 const app = express();
 
 app.use(cors());
 app.use(express.json());
+
+startMessageRecoveryWorker();
 
 app.use("/auth", authRouter);
 app.use("/sms", smsRoutes);
